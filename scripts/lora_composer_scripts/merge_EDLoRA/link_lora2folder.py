@@ -5,13 +5,13 @@ link_mapping = {
     "potter+hermione+pyramid_background+shake_hands": ["potter","hermione","pyramid"],
     "2real": ["potter","hermione"],
     "2real2": ["hinton","lecun"],
-    "2real3": ["bengio","lecun"],
+    "2real3": ["bengio","potter"],
     "2dog+1cat": ["dogA","dogB","catA"],
     "5real": ["rock","potter","hermione","dogA","catA"],
     "5real2": ["rock","bengio","hinton","dogA","catA"],
     "5real3": ["rock","potter","hinton","dogA","catA"],
     "3real": ["lecun","bengio","hinton"],
-    "4real": ["bengio","potter","hermione","dogA"],
+    "4real": ["bengio","hinton","hermione","dogA"],
     "4real2": ["hinton","potter","lecun","dogA"],
     "4real3": ["hinton","potter","hermione","catA"]
 }

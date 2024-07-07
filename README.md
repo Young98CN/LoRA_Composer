@@ -28,7 +28,7 @@
 
 ## 🚩 Updates/Todo List
 
-- [ ] Memory optimization  (There is a lot of GPU memory redundancy in the existing code, and N concept LoRAs need to store N pipelines).
+- [x] Memory optimization in [optimized_branch](https://github.com/Young98CN/LoRA_Composer/tree/optimized_version)  (There is a lot of GPU memory redundancy in the existing code, and N concept LoRAs need to store N pipelines).
 - [x] Code Released.
 
 
