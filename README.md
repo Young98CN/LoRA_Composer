@@ -60,6 +60,7 @@ cd LoRA_Composer
 pip install .
 
 # Install diffusers==0.14.0 with T2I-Adapter support(install from source)
+git clone -b T2IAdapter-for-mixofshow https://github.com/guyuchao/diffusers-t2i-adapter.git
 cd diffusers-t2i-adapter
 pip install .
 ```
