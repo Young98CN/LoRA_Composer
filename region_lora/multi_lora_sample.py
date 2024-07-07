@@ -261,7 +261,7 @@ def register_region_aware_attention(model, layerwise_embedding=False):
             
             # Region-Aware LoRA Injection
             for idx, region in enumerate(region_list):
-                region_key, region_value, region_box, decoder = region
+                region_key, region_value, region_box, decoder, lora_to_out = region
                 if self.upcast_attention:
                     query = query.float()
                     region_key = region_key.float()
@@ -296,7 +296,7 @@ def register_region_aware_attention(model, layerwise_embedding=False):
                 
                 hidden_state_region = rearrange(hidden_state_region, 'b h w c -> b (h w) c')
                 hidden_state_region = decoder.batch_to_head_dim(hidden_state_region)
-                hidden_state_region = decoder.to_out[0](hidden_state_region)
+                hidden_state_region = decoder.to_out[0](hidden_state_region) + torch.matmul(hidden_state_region, lora_to_out.T)
                 hidden_state_region = decoder.to_out[1](hidden_state_region)
                 hidden_state_region = rearrange(hidden_state_region, 'b (h w) c -> b h w c', h=end_h - start_h, w=end_w - start_w)
                 
@@ -327,36 +327,12 @@ def register_region_aware_attention(model, layerwise_embedding=False):
             if self.cross_attention_norm:
                 encoder_hidden_states = self.norm_cross(encoder_hidden_states)
             
-            region_list = []
-            pipe_lora = cross_attention_kwargs['pipe_lora_list']
-            # Region-Aware LoRA Injection (prepare K and V)
-            for region, lora_idx in zip(cross_attention_kwargs['region_list'], cross_attention_kwargs['lora_pipe_idx']):
-                if cross_attention_idx < 6:
-                    cross_attention_lora = pipe_lora[lora_idx].unet.down_blocks[cross_attention_idx // 2].attentions[cross_attention_idx % 2].transformer_blocks[0].attn2
-                    
-                elif cross_attention_idx > 6:
-                    up_id = cross_attention_idx - 7
-                    cross_attention_lora = pipe_lora[lora_idx].unet.up_blocks[up_id // 3 + 1].attentions[up_id % 3].transformer_blocks[0].attn2
-                else:
-                    cross_attention_lora = pipe_lora[lora_idx].unet.mid_block.attentions[0].transformer_blocks[0].attn2
-                if layerwise_embedding: 
-                    region_key = cross_attention_lora.to_k(region[0][:, cross_attention_idx, ...])
-                    region_value = cross_attention_lora.to_v(region[0][:, cross_attention_idx, ...])
-                else:
-                    region_key = cross_attention_lora.to_k(region[0])
-                    region_value = cross_attention_lora.to_v(region[0])
-                region_key = cross_attention_lora.head_to_batch_dim(region_key)
-                region_value = cross_attention_lora.head_to_batch_dim(region_value)
-                region_list.append((region_key, region_value, region[1], cross_attention_lora))
-            
             key = self.to_k(encoder_hidden_states)
             value = self.to_v(encoder_hidden_states)
 
             query = self.head_to_batch_dim(query)
             key = self.head_to_batch_dim(key)
             value = self.head_to_batch_dim(value)
-
-            attention_probs = self.get_attention_scores(query, key, attention_mask)
 
             if cross_attention_idx < 6:
                 unet_type = 'down'
@@ -376,9 +352,9 @@ def register_region_aware_attention(model, layerwise_embedding=False):
                 attn_mask_list = []
                 attn_mask_list_vis = []
                 background_mask = torch.ones((feat_height, feat_width))
-                for region in region_list:
+                for region in cross_attention_kwargs['region_list']:
                     attn_mask = torch.zeros((feat_height, feat_width))
-                    start_h, start_w, end_h, end_w = region[2]
+                    start_h, start_w, end_h, end_w = region[1]
                     start_h, start_w, end_h, end_w = math.ceil(start_h * feat_height), math.ceil(
                         start_w * feat_width), math.floor(end_h * feat_height), math.floor(end_w * feat_width)
                     attn_mask[start_h:end_h, start_w:end_w] += 1
@@ -402,7 +378,9 @@ def register_region_aware_attention(model, layerwise_embedding=False):
                     attention_scores = torch.baddbmm(attention_mask, query, key.transpose(-1, -2),beta=1,alpha=self.scale)
                     attention_probs = attention_scores.softmax(dim=-1)
                     attention_probs = attention_probs.to(query.dtype)
-            
+            else:
+                attention_probs = self.get_attention_scores(query, key, attention_mask)
+                
             # save attention map
             if cross_attention_kwargs['attention_store'] is not None:
                 attention_store = cross_attention_kwargs['attention_store']
@@ -423,22 +401,92 @@ def register_region_aware_attention(model, layerwise_embedding=False):
             # dropout
             hidden_states = self.to_out[1](hidden_states)
             
-            if is_cross:    
-                if cross_attention_kwargs['step']<50:
-                    if not cross_attention_kwargs['vis_region_rewrite_decoder']:
-                        attention_store = None
-         
-                    hidden_states = region_rewrite(
-                        self,
-                        hidden_states=hidden_states,
-                        query=query,
-                        region_list=region_list,
-                        height=cross_attention_kwargs['height'],
-                        width=cross_attention_kwargs['width'],
-                        attention_store=attention_store,
-                        unet_type=unet_type,
-                        )
+            if is_cross:
+                region_list = []
+                unet_lora_weight_list = cross_attention_kwargs['unet_lora_weight_list']
+                base_unet = cross_attention_kwargs['base_unet']
+                # Region-Aware LoRA Injection (prepare K and V)
+                for region, lora_idx in zip(cross_attention_kwargs['region_list'], cross_attention_kwargs['lora_pipe_idx']):
+                    if cross_attention_idx < 6:
+                        cross_attention_lora = base_unet.down_blocks[cross_attention_idx // 2].attentions[cross_attention_idx % 2].transformer_blocks[0].attn2
+                        # lora for K
+                        lora_weight_key_k = 'down_blocks.{}.attentions.{}.transformer_blocks.0.attn2.to_k_lora.down.weight'.format(cross_attention_idx // 2, cross_attention_idx % 2)
+                        lora_param_down_k = unet_lora_weight_list[lora_idx][lora_weight_key_k]
+                        lora_param_up_k = unet_lora_weight_list[lora_idx][lora_weight_key_k.replace('lora.down', 'lora.up')]
+                        lora_param_k = lora_param_up_k @ lora_param_down_k
+                        # lora for V
+                        lora_weight_key_v = lora_weight_key_k.replace('to_k_lora', 'to_v_lora')
+                        lora_param_down_v = unet_lora_weight_list[lora_idx][lora_weight_key_v]
+                        lora_param_up_v = unet_lora_weight_list[lora_idx][lora_weight_key_v.replace('lora.down', 'lora.up')]
+                        lora_param_v = lora_param_up_v @ lora_param_down_v
+                        # lora for out_proj
+                        lora_weight_key_out = lora_weight_key_k.replace('to_k_lora', 'to_out.0_lora')
+                        lora_param_down_out = unet_lora_weight_list[lora_idx][lora_weight_key_out]
+                        lora_param_up_out = unet_lora_weight_list[lora_idx][lora_weight_key_out.replace('lora.down', 'lora.up')]
+                        lora_param_out = lora_param_up_out @ lora_param_down_out
+                        
+                    elif cross_attention_idx > 6:
+                        up_id = cross_attention_idx - 7
+                        cross_attention_lora = base_unet.up_blocks[up_id // 3 + 1].attentions[up_id % 3].transformer_blocks[0].attn2
+                        # lora for K
+                        lora_weight_key_k = 'up_blocks.{}.attentions.{}.transformer_blocks.0.attn2.to_k_lora.down.weight'.format(up_id // 3 + 1, up_id % 3)
+                        lora_param_down_k = unet_lora_weight_list[lora_idx][lora_weight_key_k]
+                        lora_param_up_k = unet_lora_weight_list[lora_idx][lora_weight_key_k.replace('lora.down', 'lora.up')]
+                        lora_param_k = lora_param_up_k @ lora_param_down_k
+                        # lora for V
+                        lora_weight_key_v = lora_weight_key_k.replace('to_k_lora', 'to_v_lora')
+                        lora_param_down_v = unet_lora_weight_list[lora_idx][lora_weight_key_v]
+                        lora_param_up_v = unet_lora_weight_list[lora_idx][lora_weight_key_v.replace('lora.down', 'lora.up')]
+                        lora_param_v = lora_param_up_v @ lora_param_down_v
+                        # lora for out_proj
+                        lora_weight_key_out = lora_weight_key_k.replace('to_k_lora', 'to_out.0_lora')
+                        lora_param_down_out = unet_lora_weight_list[lora_idx][lora_weight_key_out]
+                        lora_param_up_out = unet_lora_weight_list[lora_idx][lora_weight_key_out.replace('lora.down', 'lora.up')]
+                        lora_param_out = lora_param_up_out @ lora_param_down_out
+                    else:
+                        cross_attention_lora = base_unet.mid_block.attentions[0].transformer_blocks[0].attn2
+                        # lora for K
+                        lora_weight_key_k = 'mid_block.attentions.0.transformer_blocks.0.attn2.to_k_lora.down.weight'
+                        lora_param_down_k = unet_lora_weight_list[lora_idx][lora_weight_key_k]
+                        lora_param_up_k = unet_lora_weight_list[lora_idx][lora_weight_key_k.replace('lora.down', 'lora.up')]
+                        lora_param_k = lora_param_up_k @ lora_param_down_k
+                        # lora for V
+                        lora_weight_key_v = lora_weight_key_k.replace('to_k_lora', 'to_v_lora')
+                        lora_param_down_v = unet_lora_weight_list[lora_idx][lora_weight_key_v]
+                        lora_param_up_v = unet_lora_weight_list[lora_idx][lora_weight_key_v.replace('lora.down', 'lora.up')]
+                        lora_param_v = lora_param_up_v @ lora_param_down_v
+                        # lora for out_proj
+                        lora_weight_key_out = lora_weight_key_k.replace('to_k_lora', 'to_out.0_lora')
+                        lora_param_down_out = unet_lora_weight_list[lora_idx][lora_weight_key_out]
+                        lora_param_up_out = unet_lora_weight_list[lora_idx][lora_weight_key_out.replace('lora.down', 'lora.up')]
+                        lora_param_out = lora_param_up_out @ lora_param_down_out
+                        
+                    if layerwise_embedding: 
+                        region_key = cross_attention_lora.to_k(region[0][:, cross_attention_idx, ...]) + torch.matmul(region[0][:, cross_attention_idx, ...], lora_param_k.T)
+                        region_value = cross_attention_lora.to_v(region[0][:, cross_attention_idx, ...]) + torch.matmul(region[0][:, cross_attention_idx, ...], lora_param_v.T)
 
+                    else:
+                        region_key = cross_attention_lora.to_k(region[0]) + torch.matmul(region[0], lora_param_k.T)
+                        region_value = cross_attention_lora.to_v(region[0]) + torch.matmul(region[0], lora_param_v.T)
+
+                    region_key = cross_attention_lora.head_to_batch_dim(region_key)
+                    region_value = cross_attention_lora.head_to_batch_dim(region_value)
+                    region_list.append((region_key, region_value, region[1], cross_attention_lora, lora_param_out))
+                    
+                if not cross_attention_kwargs['vis_region_rewrite_decoder'] or cross_attention_kwargs['attention_store'] is None:
+                    attention_store = None
+                
+                hidden_states = region_rewrite(
+                    self,
+                    hidden_states=hidden_states,
+                    query=query,
+                    region_list=region_list,
+                    height=cross_attention_kwargs['height'],
+                    width=cross_attention_kwargs['width'],
+                    attention_store=attention_store,
+                    unet_type=unet_type,
+                    )
+                # del region_list
             return hidden_states
 
         return new_forward
@@ -472,7 +520,8 @@ def encode_region_prompt_pplus(self,
                                negative_prompt_embeds: Optional[torch.FloatTensor] = None,
                                height=512,
                                width=512,
-                               pipeline_lora_list: List[StableDiffusionAdapterPipeline] = None,
+                               tokenizer_list: List = None,
+                               text_encoder_list: List = None,
                                attention_store = None):
     if prompt is not None and isinstance(prompt, str):
         batch_size = 1
@@ -540,30 +589,34 @@ def encode_region_prompt_pplus(self,
             region_prompt = bind_concept_prompt([region_prompt], new_concept_cfg_list[concept_idx])
             if attention_store is not None:
                 attention_store.save_region_prompt(region_prompt[0])
-            region_prompt_input_ids = pipeline_lora_list[concept_idx].tokenizer(
+            region_prompt_input_ids = tokenizer_list[concept_idx](
                 region_prompt,
                 padding='max_length',
-                max_length=pipeline_lora_list[concept_idx].tokenizer.model_max_length,
+                max_length=tokenizer_list[concept_idx].model_max_length,
                 truncation=True,
                 return_tensors='pt').input_ids
-            region_embeds = pipeline_lora_list[concept_idx].text_encoder(region_prompt_input_ids.to(device), attention_mask=None)[0]
+            region_embeds = text_encoder_list[concept_idx](region_prompt_input_ids.to(device), attention_mask=None)[0]
             region_embeds = rearrange(region_embeds, '(b n) m c -> b n m c', b=batch_size)
-            region_embeds.to(dtype=pipeline_lora_list[concept_idx].text_encoder.dtype, device=device)
+            region_embeds.to(dtype=text_encoder_list[concept_idx].dtype, device=device)
             bs_embed, layer_num, seq_len, _ = region_embeds.shape
 
             if region_neg_prompt is None:
                 region_neg_prompt = [''] * batch_size
-            region_negprompt_input_ids = pipeline_lora_list[concept_idx].tokenizer(
+            region_negprompt_input_ids = tokenizer_list[concept_idx](
                 region_neg_prompt,
                 padding='max_length',
-                max_length=pipeline_lora_list[concept_idx].tokenizer.model_max_length,
+                max_length=tokenizer_list[concept_idx].model_max_length,
                 truncation=True,
                 return_tensors='pt').input_ids
-            region_neg_embeds = pipeline_lora_list[concept_idx].text_encoder(region_negprompt_input_ids.to(device), attention_mask=None)[0]
+            region_neg_embeds = text_encoder_list[concept_idx](region_negprompt_input_ids.to(device), attention_mask=None)[0]
             region_neg_embeds = (region_neg_embeds).view(batch_size, 1, seq_len, -1).repeat(1, layer_num, 1, 1)
-            region_neg_embeds.to(dtype=pipeline_lora_list[concept_idx].text_encoder.dtype, device=device)
+            region_neg_embeds.to(dtype=text_encoder_list[concept_idx].dtype, device=device)
             region_list[idx] = (torch.cat([region_neg_embeds, region_embeds]), pos)
             region_list_positive.append([region_embeds, pos])
+        # del self.text_encoder
+        # del text_encoder_list
+        # del tokenizer_listz
+        # torch.cuda.empty_cache()
 
     return prompt_embeds, region_list, region_list_positive, lora_token_idx, lora_pipe_idx
 
@@ -583,7 +636,10 @@ def Regionally_T2IAdaptor_Sample(self,
                                  region_sketch_adaptor_weight='',
                                  height: Optional[int] = None,
                                  width: Optional[int] = None,
-                                 pipe_lora_list = None,
+                                 tokenizer_list = None,
+                                 text_encoder_list = None,
+                                 unet_lora_weight_list = None,
+                                 base_unet = None,
                                  attention_store = None,
                                  self_attn_mask = True,  # Concept Region Mask
                                  fill_loss=True,  # L_fill
@@ -666,7 +722,8 @@ def Regionally_T2IAdaptor_Sample(self,
         negative_prompt_embeds=negative_prompt_embeds,
         height=height,
         width=width,
-        pipeline_lora_list=pipe_lora_list,
+        tokenizer_list=tokenizer_list,
+        text_encoder_list=text_encoder_list,
         attention_store=attention_store,)
     # 4. Prepare timesteps
     self.scheduler.set_timesteps(num_inference_steps, device=device)
@@ -777,8 +834,10 @@ def Regionally_T2IAdaptor_Sample(self,
                         'region_list': region_list_positive,
                         'height': height,
                         'width': width,
-                        'step': 0,
-                        'pipe_lora_list': pipe_lora_list,
+                        'tokenizer_list': tokenizer_list,
+                        'text_encoder_list': text_encoder_list,
+                        'unet_lora_weight_list': unet_lora_weight_list,
+                        'base_unet': base_unet,
                         'attention_store': attention_store,
                         'self_attn_mask': self_attn_mask,
                         'vis_region_rewrite_decoder': vis_region_rewrite_decoder,
@@ -793,6 +852,7 @@ def Regionally_T2IAdaptor_Sample(self,
             select=0)
         latents = replace_latents(item_cross_att_maps, region_list_positive, 1, lora_token_idx, latents)
         latents = latents * self.scheduler.init_noise_sigma
+        torch.cuda.empty_cache()
         # denoising process            
         for i, t in enumerate(timesteps):
             # if i < 25:  # max_iter_to_alter
@@ -812,8 +872,10 @@ def Regionally_T2IAdaptor_Sample(self,
                         'region_list': region_list_positive,
                         'height': height,
                         'width': width,
-                        'step': i,
-                        'pipe_lora_list': pipe_lora_list,
+                        'tokenizer_list': tokenizer_list,
+                        'text_encoder_list': text_encoder_list,
+                        'unet_lora_weight_list': unet_lora_weight_list,
+                        'base_unet': base_unet,
                         'attention_store': attention_store,
                         'self_attn_mask': self_attn_mask,
                         'vis_region_rewrite_decoder': vis_region_rewrite_decoder,
@@ -821,8 +883,6 @@ def Regionally_T2IAdaptor_Sample(self,
                         'lora_pipe_idx': lora_pipe_idx,
                     }).sample
                     self.unet.zero_grad()
-                    for pipe_lora in pipe_lora_list:
-                        pipe_lora.unet.zero_grad()
                     
                     # Get max activation value for each subject token
                     max_attention_per_index_fg, max_attention_per_index_bg, dist_x, dist_y, local_box_mean = _aggregate_and_get_max_attention_per_token(
@@ -849,6 +909,7 @@ def Regionally_T2IAdaptor_Sample(self,
                         # print("stop_refine in step {}".format(i))
                     else:
                         loss_pre = loss
+                torch.cuda.empty_cache()
 
             # expand the latents if we are doing classifier free guidance
             latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
@@ -856,8 +917,6 @@ def Regionally_T2IAdaptor_Sample(self,
             
             if refine_flag and image_guidance:
                 self.unet.sideload_processor.update_sideload(adapter_state)  # T2i-adapter
-            # for lora in pipe_lora_list:
-            #     lora.unet.sideload_processor.update_sideload(adapter_state)
             
             # predict the noise residual
             noise_pred = self.unet(
@@ -868,8 +927,10 @@ def Regionally_T2IAdaptor_Sample(self,
                     'region_list': region_list,
                     'height': height,
                     'width': width,
-                    'step': i,
-                    'pipe_lora_list': pipe_lora_list,
+                    'tokenizer_list': tokenizer_list,
+                    'text_encoder_list': text_encoder_list,
+                    'unet_lora_weight_list': unet_lora_weight_list,
+                    'base_unet': base_unet,
                     'attention_store': attention_store,
                     'self_attn_mask': self_attn_mask,
                     'vis_region_rewrite_decoder': vis_region_rewrite_decoder,

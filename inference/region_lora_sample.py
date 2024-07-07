@@ -14,6 +14,7 @@ from region_lora.utils.attn_util import AttentionStore, Visualizer
 import glob
 import re, time
 import cv2
+NUM_CROSS_ATTENTION_LAYERS = 16
 
 
 def inference_image(pipe,
@@ -62,9 +63,72 @@ def inference_image(pipe,
     return images
 
 
-def merge_pplus2sd_(pipe, lora_weight_path):
+def merge_lora_into_weight(original_state_dict, lora_state_dict, modification_layer_names, model_type, alpha, device):
 
-    def add_new_concept(embedding):
+    def get_lora_down_name(original_layer_name):
+        if model_type == 'text_encoder':
+            lora_down_name = original_layer_name.replace('q_proj.weight', 'q_proj_lora.down.weight') \
+                .replace('k_proj.weight', 'k_proj_lora.down.weight') \
+                .replace('v_proj.weight', 'v_proj_lora.down.weight') \
+                .replace('out_proj.weight', 'out_proj_lora.down.weight') \
+                .replace('fc1.weight', 'fc1_lora.down.weight') \
+                .replace('fc2.weight', 'fc2_lora.down.weight')
+        else:
+            lora_down_name = k.replace('to_q.weight', 'to_q_lora.down.weight') \
+                .replace('to_k.weight', 'to_k_lora.down.weight') \
+                .replace('to_v.weight', 'to_v_lora.down.weight') \
+                .replace('to_out.0.weight', 'to_out.0_lora.down.weight') \
+                .replace('ff.net.0.proj.weight', 'ff.net.0.proj_lora.down.weight') \
+                .replace('ff.net.2.weight', 'ff.net.2_lora.down.weight') \
+                .replace('proj_out.weight', 'proj_out_lora.down.weight') \
+                .replace('proj_in.weight', 'proj_in_lora.down.weight')
+
+        return lora_down_name
+
+    assert model_type in ['unet', 'text_encoder']
+    new_state_dict = original_state_dict
+
+    load_cnt = 0
+    for k in modification_layer_names:
+        lora_down_name = get_lora_down_name(k)
+        lora_up_name = lora_down_name.replace('lora.down', 'lora.up')
+
+        if lora_up_name in lora_state_dict:
+            load_cnt += 1
+            original_params = new_state_dict[k]
+            # lora_down_params = lora_state_dict[lora_down_name].to(device).half()
+            # lora_up_params = lora_state_dict[lora_up_name].to(device).half()
+            lora_down_params = lora_state_dict[lora_down_name].to(device)
+            lora_up_params = lora_state_dict[lora_up_name].to(device)
+            if len(original_params.shape) == 4:
+                lora_param = lora_up_params.squeeze() @ lora_down_params.squeeze()
+                lora_param = lora_param.unsqueeze(-1).unsqueeze(-1)
+            else:
+                lora_param = lora_up_params @ lora_down_params
+            merge_params = original_params + alpha * lora_param
+            new_state_dict[k] = merge_params
+
+    return new_state_dict
+
+
+def merge_lora_weight(lora_state_dict, ori_state_dict, merge_part, device):
+    assert merge_part in ['unet', 'text_encoder'], "merge_part must be unet or text_encoder"
+    # merge lora into unet or text encoder
+    LoRA_keys = []
+    LoRA_keys += list(lora_state_dict.keys())
+    LoRA_keys = set([key.replace('_lora.down', '').replace('_lora.up', '') for key in LoRA_keys])
+    text_encoder_layer_names = LoRA_keys
+
+    merged_state_dict = merge_lora_into_weight(
+        ori_state_dict,
+        lora_state_dict,
+        text_encoder_layer_names,
+        model_type=merge_part,
+        alpha=1.0,
+        device=device)
+    return merged_state_dict
+
+def add_new_concept(tokenizer, text_encoder, embedding, start_idx):
         new_token_names = [f'<new{start_idx + layer_id}>' for layer_id in range(NUM_CROSS_ATTENTION_LAYERS)]
         num_added_tokens = tokenizer.add_tokens(new_token_names)
         assert num_added_tokens == NUM_CROSS_ATTENTION_LAYERS
@@ -75,80 +139,45 @@ def merge_pplus2sd_(pipe, lora_weight_path):
 
         token_embeds[new_token_ids] = token_embeds[new_token_ids].copy_(embedding)
         return start_idx + NUM_CROSS_ATTENTION_LAYERS, new_token_ids, new_token_names
-
+def merge_pplus2sd_(pipe, lora_weight_path):
     # step 1: list pipe module
     pipe_lora = copy.deepcopy(pipe) 
-    tokenizer, unet, text_encoder = pipe_lora.tokenizer, pipe_lora.unet, pipe_lora.text_encoder
-    lora_weight = torch.load(lora_weight_path, map_location='cpu')['params']
+    tokenizer, text_encoder = pipe_lora.tokenizer, pipe_lora.text_encoder
+    lora_weight = torch.load(lora_weight_path, map_location=device)['params']
     print("load ckpt --> {}".format(lora_weight_path))
     new_concept_cfg = {}
 
     # step 2: load embedding into tokenizer/text_encoder:
     if 'new_concept_embedding' in lora_weight and len(lora_weight['new_concept_embedding']) != 0:
         start_idx = 0
-        NUM_CROSS_ATTENTION_LAYERS = 16
-        for idx, (concept_name, embedding) in enumerate(lora_weight['new_concept_embedding'].items()):
-            start_idx, new_token_ids, new_token_names = add_new_concept(embedding)
+        for concept_name, embedding in lora_weight['new_concept_embedding'].items():
+            start_idx, new_token_ids, new_token_names = add_new_concept(tokenizer, text_encoder, embedding, start_idx)
             new_concept_cfg.update(
                 {concept_name: {
                     'concept_token_ids': new_token_ids,
                     'concept_token_names': new_token_names
                 }})
 
-    # step 3: load text_encoder_weight:
+    # step 3: merge text_encoder_weight:
     if 'text_encoder' in lora_weight and len(lora_weight['text_encoder']) != 0:
+        new_text_encoder_weights = merge_lora_weight(lora_weight['text_encoder'], text_encoder.state_dict(), 'text_encoder', pipe.device)
+        
         sd_textenc_state_dict = copy.deepcopy(text_encoder.state_dict())
 
-        for k in lora_weight['text_encoder'].keys():
-            sd_textenc_state_dict[k] = lora_weight['text_encoder'][k]
+        for k in new_text_encoder_weights.keys():
+            sd_textenc_state_dict[k] = new_text_encoder_weights[k]
         text_encoder.load_state_dict(sd_textenc_state_dict)
 
+    # step 4: load unet_weight:
     if 'unet' in lora_weight and len(lora_weight['unet']) != 0:
-        sd_unet_state_dict = copy.deepcopy(unet.state_dict())
-
-        for k in lora_weight['unet'].keys():
-            sd_unet_state_dict[k] = lora_weight['unet'][k]
-
-        unet.load_state_dict(sd_unet_state_dict)
-    return new_concept_cfg, pipe_lora
+        unet_lora_weight = lora_weight['unet']
+        for k, v in unet_lora_weight.items():
+            unet_lora_weight[k] = v.half()                
+    return new_concept_cfg, pipe_lora, unet_lora_weight
 
 
-def merge2sd_(pipe, lora_weight_path):
 
-    # step 1: list pipe module
-    tokenizer, unet, text_encoder = pipe.tokenizer, pipe.unet, pipe.text_encoder
-    lora_weight = torch.load(lora_weight_path, map_location='cpu')['params']
-
-    # step 2: load embedding into tokenizer/text_encoder:
-    if 'new_concept_embedding' in lora_weight and len(lora_weight['new_concept_embedding']) != 0:
-        new_concept_embedding = list(lora_weight['new_concept_embedding'].keys())
-
-        for new_token in new_concept_embedding:
-            # Add the placeholder token in tokenizer
-            _ = tokenizer.add_tokens(new_token)
-            new_token_id = tokenizer.convert_tokens_to_ids(new_token)
-            text_encoder.resize_token_embeddings(len(tokenizer))
-            token_embeds = text_encoder.get_input_embeddings().weight.data
-            token_embeds[new_token_id] = lora_weight['new_concept_embedding'][new_token]
-
-    # step 3: load text_encoder_weight:
-    if 'text_encoder' in lora_weight and len(lora_weight['text_encoder']) != 0:
-        sd_textenc_state_dict = copy.deepcopy(text_encoder.state_dict())
-
-        for k in lora_weight['text_encoder'].keys():
-            sd_textenc_state_dict[k] = lora_weight['text_encoder'][k]
-        text_encoder.load_state_dict(sd_textenc_state_dict)
-
-    if 'unet' in lora_weight and len(lora_weight['unet']) != 0:
-        sd_unet_state_dict = copy.deepcopy(unet.state_dict())
-
-        for k in lora_weight['unet'].keys():
-            sd_unet_state_dict[k] = lora_weight['unet'][k]
-
-        unet.load_state_dict(sd_unet_state_dict)
-
-
-def build_model(pretrained_model, combined_model_root, sketch_adaptor_model, keypose_adaptor_model, pipeline_type, device):
+def build_model(args, device):
     def build_adapter(pipe, device):
         pipe.keypose_adapter = Adapter(
                 cin=int(3 * 64), channels=[320, 640, 1280, 1280][:4], nums_rb=2, ksize=1, sk=True, use_conv=False).half()
@@ -161,10 +190,17 @@ def build_model(pretrained_model, combined_model_root, sketch_adaptor_model, key
         pipe.sketch_adapter = pipe.sketch_adapter.to(device)
         return pipe
         
-        
-    pipe_lora_list = []
+    pretrained_model = args.pretrained_model
+    combined_model_root = args.combined_model_root
+    sketch_adaptor_model = args.sketch_adaptor_model
+    keypose_adaptor_model = args.keypose_adaptor_model
+    pipeline_type = args.pipeline_type
+    
     if pipeline_type == 'adaptor_pplus' or pipeline_type == 'adaptor_sd':
         new_concept_cfg_list = []
+        tokenizer_list = []
+        text_encoder_list = []
+        unet_lora_weight_list = []
         print("start load base model")
         start = time.time()
         pipe_base = StableDiffusionAdapterPipeline.from_pretrained(
@@ -173,23 +209,73 @@ def build_model(pretrained_model, combined_model_root, sketch_adaptor_model, key
         scheduler = DPMSolverMultistepScheduler.from_config(pipe_base.scheduler.config)
         pipe_base.scheduler = scheduler
 
-        combined_model_list = glob.glob(os.path.join(combined_model_root,"**/combined_model_.pth"))
+        combined_model_list = glob.glob(os.path.join(combined_model_root,"*.pth"))
         print("start load lora model")
+        
+        # find background lora
+        bg_lora_flag = False
+        prompts = [args.prompt]
+        prompts_rewrite = [''] if args.no_region else [args.prompt_rewrite]
+        pattern = r'<(.*?)>'
+        matches = re.findall(pattern, prompts_rewrite[0])
+        # find background lora
+        match_scene = re.findall(pattern, prompts[0])
+        if len(match_scene) != 0:
+            match_pattern = '<' + match_scene[0] + '>'
+            bg_lora_flag = True
+        
         for conbined_model in combined_model_list:
             if pipeline_type == 'adaptor_pplus':
                 start = time.time()
-                new_concept_cfg, pipe_lora = merge_pplus2sd_(pipe_base, lora_weight_path=conbined_model)
-                print("load lora model cost {}s".format(time.time()-start))
+                new_concept_cfg, pipe_lora, unet_lora_weight = merge_pplus2sd_(pipe_base, conbined_model)
                 new_concept_cfg_list.append(new_concept_cfg)
-                pipe_lora = build_adapter(pipe_lora, device)
-                pipe_lora_list.append(pipe_lora)
+                tokenizer_list.append(pipe_lora.tokenizer)
+                text_encoder_list.append(pipe_lora.text_encoder)
+                unet_lora_weight_list.append(unet_lora_weight)
+                # background lora merge in the unet of basemodel
+                if bg_lora_flag: 
+                    if match_pattern in new_concept_cfg.keys():
+                        unet_state_dict = pipe_lora.unet.state_dict()
+                        sd_unet_state_dict = copy.deepcopy(unet_state_dict)
+                        new_unet_weights = merge_lora_weight(unet_lora_weight, unet_state_dict, 'unet', device)
+                        for k in new_unet_weights.keys():
+                            sd_unet_state_dict[k] = new_unet_weights[k]
+                        pipe_lora.unet.load_state_dict(sd_unet_state_dict)
+                        
+                        bg_new_concept_cfg = new_concept_cfg
+                        new_concept_cfg_list.pop()
+                        tokenizer_list.pop()
+                        text_encoder_list.pop()
+                        unet_lora_weight_list.pop()
+                        pipe_bg = copy.deepcopy(pipe_lora)
+                else:
+                    pipe_bg = copy.deepcopy(pipe_base)
+                    bg_new_concept_cfg = new_concept_cfg  # When there is no background lora, you can define it casually
+                
+                base_unet = copy.deepcopy(pipe_base.unet)
+                del pipe_lora
+                torch.cuda.empty_cache()
+                print("load lora model cost {}s".format(time.time()-start))
             else:
                 raise NotImplementedError
     else:
         raise NotImplementedError
     
-    pipe_base = build_adapter(pipe_base, device)
-    return pipe_lora_list, new_concept_cfg_list, pipe_base
+    assert len(matches) == len(new_concept_cfg_list) * 2, f"Check the matching relationship between{matches} and the number of LoRAs in the {args.combined_model_root} directory"
+
+    pipe_bg = build_adapter(pipe_bg, device)
+    
+    for unet_lora in unet_lora_weight_list:
+        keys_to_delete = [key for key in unet_lora if "to_q_lora" in key]
+        for k in keys_to_delete:
+            del unet_lora[k]
+        keys_to_delete = [key for key in unet_lora if "attn1" in key]
+        for k in keys_to_delete:
+            del unet_lora[k]
+    
+    del pipe_base
+    torch.cuda.empty_cache()
+    return new_concept_cfg_list, bg_new_concept_cfg, tokenizer_list, text_encoder_list, unet_lora_weight_list, base_unet, pipe_bg
 
 
 def prepare_text(prompt, region_prompts, height, width):
@@ -211,11 +297,11 @@ def prepare_text(prompt, region_prompts, height, width):
         prompt_region, neg_prompt_region, pos = region.split('-*-')
         prompt_region = prompt_region.replace('[', '').replace(']', '')
         neg_prompt_region = neg_prompt_region.replace('[', '').replace(']', '')
-        pos = eval(pos)  # 将字符串转换为list
+        pos = eval(pos)
         if len(pos) == 0:
             pos = [0, 0, 1, 1]
         else:
-            pos[0], pos[2] = pos[0] / height, pos[2] / height  # 缩放到生成图像的比例
+            pos[0], pos[2] = pos[0] / height, pos[2] / height
             pos[1], pos[3] = pos[1] / width, pos[3] / width
 
         region_collection.append((prompt_region, neg_prompt_region, pos))
@@ -257,28 +343,7 @@ if __name__ == '__main__':
 
     device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
-    pipe_lora_list, new_concept_cfg_list, pipe_base = build_model(args.pretrained_model, args.combined_model_root, args.sketch_adaptor_model,
-                                        args.keypose_adaptor_model, args.pipeline_type, device)  # pipe_lora中的顺序和new_concept_cfg_list是对应的
-    
-    prompts = [args.prompt]
-    prompts_rewrite = [''] if args.no_region else [args.prompt_rewrite]
-    pattern = r'<(.*?)>'
-    matches = re.findall(pattern, prompts_rewrite[0])
-    # find background lora
-    match_scene = re.findall(pattern, prompts[0])
-    if len(match_scene) != 0:
-        match_pattern = '<' + match_scene[0] + '>'
-        for i, item in enumerate(new_concept_cfg_list):
-            if match_pattern in item.keys(): 
-                pipe_base = pipe_lora_list[i]  # replace basemodel with background lora
-                pipe_lora_list.pop(i)
-                bg_new_concept_cfg = new_concept_cfg_list[i]
-                new_concept_cfg_list.pop(i)
-                break
-    else:
-        bg_new_concept_cfg = new_concept_cfg_list[0]  # When there is no background lora, you can define it casually
-    print(len(matches), len(pipe_lora_list) * 2)
-    assert len(matches) == len(pipe_lora_list) * 2, f"Check the matching relationship between{matches} and the number of LoRAs in the {args.combined_model_root} directory"
+    new_concept_cfg_list, bg_new_concept_cfg, tokenizer_list, text_encoder_list, unet_lora_weight_list, base_unet, pipe_bg = build_model(args, device)  # pipe_lora中的顺序和new_concept_cfg_list是对应的
         
     if args.pipeline_type == 'adaptor_pplus':  # condition
         if args.sketch_condition is not None and os.path.exists(args.sketch_condition):
@@ -317,9 +382,14 @@ if __name__ == '__main__':
             'bg_new_concept_cfg': bg_new_concept_cfg,
             'height': height,
             'width': width,
-            'pipe_lora_list': pipe_lora_list,
+            'tokenizer_list': tokenizer_list,
+            'text_encoder_list': text_encoder_list,
+            'unet_lora_weight_list': unet_lora_weight_list,
+            'base_unet': base_unet,
             'image_guidance': args.image_guidance
         }
+        prompts = [args.prompt]
+        prompts_rewrite = [''] if args.no_region else [args.prompt_rewrite]
         input_prompt = [prepare_text(p, p_w, height, width) for p, p_w in zip(prompts, prompts_rewrite)]
         save_prompt = input_prompt[0][0]
     elif args.pipeline_type == 'sd':
@@ -334,9 +404,8 @@ if __name__ == '__main__':
         raise NotImplementedError
     
     attention_store = AttentionStore('all', resolution=attn_resolution)
-    vis = Visualizer(pipe_base, pipe_lora_list,attention_store,draw_region=False)
     image = inference_image(
-        pipe_base,
+        pipe_bg,
         input_prompt=input_prompt,
         input_neg_prompt=[args.negative_prompt] * len(input_prompt),
         generator=torch.Generator(device).manual_seed(args.seed),

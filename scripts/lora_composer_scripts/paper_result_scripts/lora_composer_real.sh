@@ -2,7 +2,7 @@ combined_model_root="experiments/link_folder"
 image_guidance=''
 
 #---------------------------------------------samoke potter_rock---------------------------------------------
-potter_rock_new=0
+potter_rock_new=1
 potter_rock_expdir_new='potter+hermione+rock_background'
 if [ ${potter_rock_new} -eq 1 ]
 then
@@ -47,7 +47,7 @@ then
 fi
 
 #--------------------------------------------potter_pyramid shake hands---------------------------------------------
-potter_pyramid_new=1
+potter_pyramid_new=0
 potter_pyramid_expdir_new='potter+hermione+pyramid_background+shake_hands'
 if [ ${potter_pyramid_new} -eq 1 ]
 then
@@ -94,7 +94,7 @@ then
 fi
 
 #---------------------------------------------2real------------------------------------------
-real2=0
+real2=1
 real2_expdir='2real'
 
 if [ ${real2} -eq 1 ]
@@ -140,7 +140,7 @@ then
 fi
 
 #---------------------------------------------2real_2------------------------------------------
-real2_2=0
+real2_2=1
 real2_2_expdir='2real2'
 
 if [ ${real2_2} -eq 1 ]
@@ -230,7 +230,7 @@ then
 fi
 
 #---------------------------------------------sample dog-------------------------------------------
-sample_dog=1
+sample_dog=0
 sample_dog_expdir='2dog+1cat'
 
 if [ ${sample_dog} -eq 1 ]
@@ -282,7 +282,7 @@ fi
 
 
 #---------------------------------------------5real---------------------------------------------
-real5=1
+real5=0
 real5_expdir='5real'
 if [ ${real5} -eq 1 ]
 then
@@ -337,7 +337,7 @@ then
 fi
 
 #---------------------------------------------5real2---------------------------------------------
-real5_2=1
+real5_2=0
 real5_2_expdir='5real2'
 if [ ${real5_2} -eq 1 ]
 then
@@ -392,7 +392,7 @@ then
 fi
 
 #---------------------------------------------5real3---------------------------------------------
-real5_3=1
+real5_3=0
 real5_3_expdir='5real3'
 if [ ${real5_3} -eq 1 ]
 then
@@ -447,7 +447,7 @@ then
 fi
 
 #---------------------------------------------sample lecun-------------------------------------------
-sample_lecun=1
+sample_lecun=0
 sample_lecun_expdir='3real'
 if [ ${sample_lecun} -eq 1 ]
 then
@@ -554,7 +554,7 @@ then
 fi
 
 #---------------------------------------------4real_2-------------------------------------------
-real4_2=1
+real4_2=0
 real4_2_expdir='4real2'
 if [ ${real4_2} -eq 1 ]
 then
@@ -610,7 +610,7 @@ then
 fi
 
 #---------------------------------------------4real_3-------------------------------------------
-real4_3=1
+real4_3=0
 real4_3_expdir='4real3'
 if [ ${real4_3} -eq 1 ]
 then
