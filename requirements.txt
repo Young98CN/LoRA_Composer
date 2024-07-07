@@ -1,0 +1,6 @@
+chardet
+einops
+transformers
+matplotlib
+opencv-python
+accelerate

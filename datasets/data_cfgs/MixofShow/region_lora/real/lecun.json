@@ -1,0 +1,8 @@
+[
+    {
+        "lora_path": "loras/real/lecun.pth",
+        "unet_alpha": 1.0,
+        "text_encoder_alpha": 1.0,
+        "concept_name": "<lecun1> <lecun2>"
+    }
+]
