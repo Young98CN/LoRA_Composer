@@ -1,0 +1,8 @@
+[
+    {
+        "lora_path": "loras/background/edlora_rock.pth",
+        "unet_alpha": 1.0,
+        "text_encoder_alpha": 1.0,
+        "concept_name": "<rock1> <rock2>"
+    }
+]

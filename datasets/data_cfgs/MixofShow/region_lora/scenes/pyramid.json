@@ -1,0 +1,8 @@
+[
+    {
+        "lora_path": "loras/background/edlora_pyramid.pth",
+        "unet_alpha": 1.0,
+        "text_encoder_alpha": 1.0,
+        "concept_name": "<pyramid1> <pyramid2>"
+    }
+]
