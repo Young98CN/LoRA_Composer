@@ -1,6 +1,6 @@
 # LoRA-Composer
 
-**[LoRA-Composer: Leveraging Low-Rank Adaptation for Multi-Concept Customization in Training-Free Diffusion Models](https://arxiv.org/abs/2305.18292)**
+**[LoRA-Composer: Leveraging Low-Rank Adaptation for Multi-Concept Customization in Training-Free Diffusion Models](https://arxiv.org/abs/2403.11627)**
 <br/>
 [Yang Yang](https://young98cn.github.io/), [Wen Wang](https://github.com/encounter1997), Liang Peng, Chaotian Song, Yao Chen, Hengjia Li, Xiaolong Yang, Qinglin Lu, Deng Cai, Wei Liu, Boxi Wu
 <br/>
