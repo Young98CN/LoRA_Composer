@@ -75,14 +75,11 @@ We adopt the [ChilloutMix](https://huggingface.co/windwhinny/chilloutmix) for re
 
 ```bash
 cd experiments/pretrained_models
-# Make sure you have git-lfs installed
-git lfs install
-
 # Diffusers-version ChilloutMix
-git-lfs clone https://huggingface.co/windwhinny/chilloutmix.git
+git lfs clone https://huggingface.co/windwhinny/chilloutmix.git
 
 # Diffusers-version Anything-v4
-git-lfs clone https://huggingface.co/andite/anything-v4.0.git --exclude="anything*, Anything*, example*"
+git lfs clone https://huggingface.co/xyn-ai/anything-v4.0.git --exclude="anything*, Anything*, example*, *.safetensors"
 
 mkdir t2i_adapter
 cd t2i_adapter
