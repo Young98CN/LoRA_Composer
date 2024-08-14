@@ -144,7 +144,7 @@ find scripts/lora_composer_scripts/merge_EDLoRA -type f -name "*.sh" -exec echo 
 
 python scripts/lora_composer_scripts/merge_EDLoRA/link_lora2folder.py
 ```
-2. Partial results of the paper can be obtained by running the following command
+1. Partial results of the paper can be obtained by running the following command (**The ‘–image_guidance’ option is used to activate conditions such as pose and sketch.**)
 ```bash
 bash scripts/lora_composer_scripts/paper_result_scripts/lora_composer_anime.sh
 bash scripts/lora_composer_scripts/paper_result_scripts/lora_composer_real.sh
